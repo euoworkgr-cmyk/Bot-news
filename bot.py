@@ -377,6 +377,8 @@ def openrouter_json(prompt, max_tokens):
         result = extract_json_object(choice.get("message", {}).get("content"))
         if result is None:
             log.warning("OpenRouter returned no valid JSON object; request will be retried")
+        else:
+            log.info("OpenRouter request succeeded: model=%s", OPENROUTER_MODEL)
         return result
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
