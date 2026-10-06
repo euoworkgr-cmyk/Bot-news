@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 User=newsbot
+Group=newsbot
 WorkingDirectory=/opt/newsbot
-EnvironmentFile=/opt/newsbot/.env
-ExecStart=/opt/newsbot/venv/bin/python bot.py
+EnvironmentFile=/etc/newsbot.env
+ExecStart=/opt/newsbot/venv/bin/python /opt/newsbot/bot.py
 Restart=always
 RestartSec=10
 MemoryMax=200M
