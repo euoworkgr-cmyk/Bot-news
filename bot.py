@@ -3,25 +3,25 @@ Telegram news bot with AI-assisted recommendations.
 
 Behavior:
 - Collects new articles from RSS feeds instead of sending everything immediately.
-- Uses Gemini in batches to rank articles against a persistent recommendation profile.
+- Uses OpenRouter in batches to rank articles against a persistent recommendation profile.
 - Sends at most DAILY_NEWS_LIMIT articles per local calendar day.
 - Sends an AI summary of each selected article plus source/link.
 - 👍 / 👎 votes are stored in SQLite.
 - At the first AI-enabled start, existing votes bootstrap the recommendation profile.
-- After local midnight, one Gemini request updates the profile from the previous day's results.
+- After local midnight, one OpenRouter request updates the profile from the previous day's results.
 
 Environment:
   BOT_TOKEN             Telegram bot token (required)
   CHAT_ID               Telegram user/chat id (required)
-  GEMINI_API_KEY        Google AI Studio API key (required for AI ranking)
-  GEMINI_MODEL          default: gemini-3.5-flash-lite
+  OPENROUTER_API_KEY    OpenRouter API key (required for AI ranking)
+  OPENROUTER_MODEL      default: google/gemini-2.5-flash-lite
   CHECK_INTERVAL        RSS check interval seconds (default: 600)
   DB_PATH               SQLite path (default: news.db)
   PROFILE_PATH          profile JSON path (default: next to DB)
   BOT_TIMEZONE          IANA timezone for the daily limit (default: Asia/Novosibirsk)
   DAILY_NEWS_LIMIT      maximum sent articles per calendar day (default: 10)
   AI_BATCH_SIZE         process immediately when at least this many candidates exist (default: 5)
-  AI_BATCH_MAX_ITEMS    max candidates in one Gemini request (default: 10)
+  AI_BATCH_MAX_ITEMS    max candidates in one OpenRouter request (default: 10)
   AI_BATCH_MAX_WAIT     flush a smaller batch after this many seconds (default: 3600)
   AI_MAX_SEND_PER_BATCH max articles sent from one batch (default: 3)
   AI_MIN_SCORE          minimum AI relevance score, 0..100 (default: 65)
@@ -47,8 +47,10 @@ from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"
+).strip()
 
 INTERVAL = int(os.environ.get("CHECK_INTERVAL", "600"))
 DB_PATH = os.environ.get("DB_PATH", "news.db")
@@ -301,29 +303,25 @@ def save_profile(profile):
             pass
 
 
-# ---------- Gemini ----------
+# ---------- OpenRouter ----------
 
-def gemini_json(prompt):
-    if not GEMINI_API_KEY:
-        log.error("GEMINI_API_KEY is not configured; AI ranking is disabled")
+def openrouter_json(prompt):
+    if not OPENROUTER_API_KEY:
+        log.error("OPENROUTER_API_KEY is not configured; AI ranking is disabled")
         return None
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
+    url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-        },
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
     }
     try:
         r = requests.post(
             url,
             headers={
-                "x-goog-api-key": GEMINI_API_KEY,
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -331,11 +329,12 @@ def gemini_json(prompt):
         )
         r.raise_for_status()
         data = r.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        text = "".join(part.get("text", "") for part in parts)
-        return json.loads(text)
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("empty model response")
+        return json.loads(content)
     except Exception as e:
-        log.warning("Gemini request failed (%s)", type(e).__name__)
+        log.warning("OpenRouter request failed (%s)", type(e).__name__)
         return None
 
 
@@ -392,17 +391,17 @@ def bootstrap_profile(db):
         log.info("Recommendation profile ready; no historical votes yet")
         return
 
-    if not GEMINI_API_KEY:
+    if not OPENROUTER_API_KEY:
         if not Path(PROFILE_PATH).exists():
             save_profile(previous)
-        log.warning("Historical votes found, but GEMINI_API_KEY is missing; profile bootstrap postponed")
+        log.warning("Historical votes found, but OPENROUTER_API_KEY is missing; profile bootstrap postponed")
         return
 
     examples = [
         {"source": r["source"], "title": r["title"], "vote": r["vote"]}
         for r in rows
     ]
-    result = gemini_json(profile_prompt(previous, examples, "все накопленные голоса"))
+    result = openrouter_json(profile_prompt(previous, examples, "все накопленные голоса"))
     if isinstance(result, dict):
         save_profile(result)
         set_state(db, "profile_bootstrapped", "1")
@@ -441,7 +440,7 @@ def update_profile_for_day(db, day):
         log.info("Nightly profile update skipped for %s: no new votes", day.isoformat())
         return True
 
-    result = gemini_json(profile_prompt(previous, examples, day.isoformat()))
+    result = openrouter_json(profile_prompt(previous, examples, day.isoformat()))
     if not isinstance(result, dict):
         return False
 
@@ -728,14 +727,14 @@ def process_candidate_batch(db, force=False):
     if not force and len(rows) < AI_BATCH_SIZE and oldest_age < AI_BATCH_MAX_WAIT:
         return
 
-    if not GEMINI_API_KEY:
-        log.warning("AI candidates are waiting, but GEMINI_API_KEY is missing")
+    if not OPENROUTER_API_KEY:
+        log.warning("AI candidates are waiting, but OPENROUTER_API_KEY is missing")
         return
 
     profile = load_profile()
-    result = gemini_json(rank_prompt(profile, rows, capacity))
+    result = openrouter_json(rank_prompt(profile, rows, capacity))
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
-        log.warning("Gemini ranking returned invalid data; batch kept for retry")
+        log.warning("OpenRouter ranking returned invalid data; batch kept for retry")
         set_state(db, "ai_retry_after", str(int(time.time()) + 300))
         return
 
@@ -757,7 +756,7 @@ def process_candidate_batch(db, force=False):
             continue
 
     if set(by_id) != valid_ids:
-        log.warning("Gemini ranking omitted candidate ids; batch kept for retry")
+        log.warning("OpenRouter ranking omitted candidate ids; batch kept for retry")
         set_state(db, "ai_retry_after", str(int(time.time()) + 300))
         return
 
@@ -837,8 +836,8 @@ def main():
     bootstrap_profile(db)
 
     log.info(
-        "Bot started: %d sites, %ds checks, daily limit %d, AI model %s, timezone %s",
-        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, GEMINI_MODEL, BOT_TIMEZONE,
+        "Bot started: %d sites, %ds checks, daily limit %d, OpenRouter model %s, timezone %s",
+        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, OPENROUTER_MODEL, BOT_TIMEZONE,
     )
 
     next_check = 0.0
