@@ -44,7 +44,7 @@ MIN_SCORE = float(_min) if _min else None
 # Site name -> RSS feed. Add or remove sites here.
 FEEDS = {
     "Habr": "https://habr.com/ru/rss/articles/?fl=ru",
-    "Rozetked": "https://rozetked.me/rss",  # URL not verified yet
+    "Rozetked": "https://rozetked.me/rss.xml",
     "Meduza": "https://meduza.io/rss/all",
 }
 
