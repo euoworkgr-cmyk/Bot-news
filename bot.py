@@ -14,7 +14,7 @@ Environment:
   BOT_TOKEN             Telegram bot token (required)
   CHAT_ID               Telegram user/chat id (required)
   OPENROUTER_API_KEY    OpenRouter API key (required for AI ranking)
-  OPENROUTER_MODEL      default: google/gemini-2.5-flash-lite
+  OPENROUTER_MODEL      default: nvidia/nemotron-3.5-lightning:free
   CHECK_INTERVAL        RSS check interval seconds (default: 600)
   DB_PATH               SQLite path (default: news.db)
   PROFILE_PATH          profile JSON path (default: next to DB)
@@ -25,6 +25,8 @@ Environment:
   AI_BATCH_MAX_WAIT     flush a smaller batch after this many seconds (default: 3600)
   AI_MAX_SEND_PER_BATCH max articles sent from one batch (default: 3)
   AI_MIN_SCORE          minimum AI relevance score, 0..100 (default: 65)
+  OPENROUTER_RANKING_MAX_TOKENS max output tokens per batch (default: 8192)
+  OPENROUTER_PROFILE_MAX_TOKENS max output tokens per profile update (default: 2048)
   ALLOWED_VOTERS        comma-separated Telegram user ids allowed to vote
 """
 import html
@@ -49,8 +51,14 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "google/gemini-2.5-flash-lite"
+    "OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"
 ).strip()
+OPENROUTER_RANKING_MAX_TOKENS = int(
+    os.environ.get("OPENROUTER_RANKING_MAX_TOKENS", "8192")
+)
+OPENROUTER_PROFILE_MAX_TOKENS = int(
+    os.environ.get("OPENROUTER_PROFILE_MAX_TOKENS", "2048")
+)
 
 INTERVAL = int(os.environ.get("CHECK_INTERVAL", "600"))
 DB_PATH = os.environ.get("DB_PATH", "news.db")
@@ -305,7 +313,39 @@ def save_profile(profile):
 
 # ---------- OpenRouter ----------
 
-def openrouter_json(prompt):
+def extract_json_object(content):
+    """Parse a JSON object from plain, fenced, or prose-wrapped model output."""
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    content = content.strip()
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.I | re.S)
+    if fenced:
+        try:
+            parsed = json.loads(fenced.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", content):
+        try:
+            parsed, _ = decoder.raw_decode(content[match.start():])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def openrouter_json(prompt, max_tokens):
     if not OPENROUTER_API_KEY:
         log.error("OPENROUTER_API_KEY is not configured; AI ranking is disabled")
         return None
@@ -315,7 +355,8 @@ def openrouter_json(prompt):
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"},
+        "max_tokens": max_tokens,
+        "reasoning": {"enabled": False},
     }
     try:
         r = requests.post(
@@ -329,12 +370,20 @@ def openrouter_json(prompt):
         )
         r.raise_for_status()
         data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("empty model response")
-        return json.loads(content)
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "length":
+            log.warning("OpenRouter response reached max_tokens; request will be retried")
+            return None
+        result = extract_json_object(choice.get("message", {}).get("content"))
+        if result is None:
+            log.warning("OpenRouter returned no valid JSON object; request will be retried")
+        return result
     except Exception as e:
-        log.warning("OpenRouter request failed (%s)", type(e).__name__)
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is not None:
+            log.warning("OpenRouter request failed (HTTP %s)", status)
+        else:
+            log.warning("OpenRouter request failed (%s)", type(e).__name__)
         return None
 
 
@@ -401,7 +450,10 @@ def bootstrap_profile(db):
         {"source": r["source"], "title": r["title"], "vote": r["vote"]}
         for r in rows
     ]
-    result = openrouter_json(profile_prompt(previous, examples, "все накопленные голоса"))
+    result = openrouter_json(
+        profile_prompt(previous, examples, "все накопленные голоса"),
+        OPENROUTER_PROFILE_MAX_TOKENS,
+    )
     if isinstance(result, dict):
         save_profile(result)
         set_state(db, "profile_bootstrapped", "1")
@@ -440,7 +492,10 @@ def update_profile_for_day(db, day):
         log.info("Nightly profile update skipped for %s: no new votes", day.isoformat())
         return True
 
-    result = openrouter_json(profile_prompt(previous, examples, day.isoformat()))
+    result = openrouter_json(
+        profile_prompt(previous, examples, day.isoformat()),
+        OPENROUTER_PROFILE_MAX_TOKENS,
+    )
     if not isinstance(result, dict):
         return False
 
@@ -732,7 +787,10 @@ def process_candidate_batch(db, force=False):
         return
 
     profile = load_profile()
-    result = openrouter_json(rank_prompt(profile, rows, capacity))
+    result = openrouter_json(
+        rank_prompt(profile, rows, capacity),
+        OPENROUTER_RANKING_MAX_TOKENS,
+    )
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         log.warning("OpenRouter ranking returned invalid data; batch kept for retry")
         set_state(db, "ai_retry_after", str(int(time.time()) + 300))
@@ -741,6 +799,8 @@ def process_candidate_batch(db, force=False):
     by_id = {}
     valid_ids = {int(r["id"]) for r in rows}
     for item in result["items"]:
+        if not isinstance(item, dict):
+            continue
         try:
             item_id = int(item.get("id"))
             if item_id not in valid_ids:
