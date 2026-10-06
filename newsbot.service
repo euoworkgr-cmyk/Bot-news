@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram news bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=newsbot
+WorkingDirectory=/opt/newsbot
+EnvironmentFile=/opt/newsbot/.env
+ExecStart=/opt/newsbot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
