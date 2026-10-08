@@ -2,13 +2,16 @@
 Telegram news bot with AI-assisted recommendations.
 
 Behavior:
-- Collects new articles from RSS feeds instead of sending everything immediately.
-- Uses OpenRouter in batches to rank articles against a persistent recommendation profile.
-- Sends at most DAILY_NEWS_LIMIT articles per local calendar day.
-- Sends an AI summary of each selected article plus source/link.
+- Collects new articles from RSS feeds into a queue instead of sending everything immediately.
+- During ACTIVE_HOURS, ranks queued articles in batches with OpenRouter against a
+  persistent recommendation profile. The best ones (with AI summaries) become "ready".
+- Posts the best ready article whenever a send slot opens. Slots are spread evenly over
+  the active hours (PACE_POSTS), up to DAILY_NEWS_LIMIT per local calendar day.
+- Failed AI requests back off exponentially; bad model output shrinks the next batch.
 - 👍 / 👎 votes are stored in SQLite.
 - At the first AI-enabled start, existing votes bootstrap the recommendation profile.
-- After local midnight, one OpenRouter request updates the profile from the previous day's results.
+- Once a day, one OpenRouter request updates the profile with every vote made since
+  the previous update.
 
 Environment:
   BOT_TOKEN             Telegram bot token (required)
@@ -18,13 +21,20 @@ Environment:
   CHECK_INTERVAL        RSS check interval seconds (default: 600)
   DB_PATH               SQLite path (default: news.db)
   PROFILE_PATH          profile JSON path (default: next to DB)
-  BOT_TIMEZONE          IANA timezone for the daily limit (default: Asia/Novosibirsk)
+  BOT_TIMEZONE          IANA timezone for the daily limit and active hours (default: UTC)
   DAILY_NEWS_LIMIT      maximum sent articles per calendar day (default: 10)
+  ACTIVE_HOURS          local hours when the bot ranks and posts, e.g. 8-23 (default: 0-24)
+  PACE_POSTS            1 = spread the daily limit evenly over ACTIVE_HOURS, 0 = post as
+                        soon as articles are ready (default: 1)
   AI_BATCH_SIZE         process immediately when at least this many candidates exist (default: 5)
   AI_BATCH_MAX_ITEMS    max candidates in one OpenRouter request (default: 10)
   AI_BATCH_MAX_WAIT     flush a smaller batch after this many seconds (default: 3600)
   AI_MAX_SEND_PER_BATCH max articles sent from one batch (default: 3)
   AI_MIN_SCORE          minimum AI relevance score, 0..100 (default: 65)
+  AI_DAILY_REQUEST_LIMIT max ranking requests per day, 0 = no limit (default: 40);
+                        the daily profile update is always allowed
+  ARTICLE_MAX_CHARS     max article text characters kept per article (default: 12000)
+  CANDIDATE_MAX_AGE_HOURS drop queued or ready articles older than this (default: 24)
   OPENROUTER_RANKING_MAX_TOKENS max output tokens per batch (default: 8192)
   OPENROUTER_PROFILE_MAX_TOKENS max output tokens per profile update (default: 2048)
   ALLOWED_VOTERS        comma-separated Telegram user ids allowed to vote
@@ -37,7 +47,7 @@ import re
 import sqlite3
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -75,8 +85,22 @@ AI_BATCH_MAX_ITEMS = int(os.environ.get("AI_BATCH_MAX_ITEMS", "10"))
 AI_BATCH_MAX_WAIT = int(os.environ.get("AI_BATCH_MAX_WAIT", "3600"))
 AI_MAX_SEND_PER_BATCH = int(os.environ.get("AI_MAX_SEND_PER_BATCH", "3"))
 AI_MIN_SCORE = float(os.environ.get("AI_MIN_SCORE", "65"))
+AI_DAILY_REQUEST_LIMIT = int(os.environ.get("AI_DAILY_REQUEST_LIMIT", "40"))
 ARTICLE_MAX_CHARS = int(os.environ.get("ARTICLE_MAX_CHARS", "12000"))
 CANDIDATE_MAX_AGE_HOURS = int(os.environ.get("CANDIDATE_MAX_AGE_HOURS", "24"))
+ACTIVE_HOURS = os.environ.get("ACTIVE_HOURS", "0-24").strip()
+PACE_POSTS = os.environ.get("PACE_POSTS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def parse_active_hours(value):
+    m = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", value or "0-24")
+    start, end = (int(m[1]), int(m[2])) if m else (-1, -1)
+    if not 0 <= start < end <= 24:
+        raise SystemExit(f"ACTIVE_HOURS must look like 8-23 (start < end, 0..24), got {value!r}")
+    return start, end
+
+
+ACTIVE_START, ACTIVE_END = parse_active_hours(ACTIVE_HOURS)
 
 ALLOWED_VOTERS = {
     int(x) for x in os.environ.get("ALLOWED_VOTERS", "").replace(" ", "").split(",") if x
@@ -91,6 +115,7 @@ FEEDS = {
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/3.0)"}
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 KEEP_DAYS = 60
+SEND_MAX_FAILURES = 5  # give up on an article after this many failed Telegram sends
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("newsbot")
@@ -131,6 +156,8 @@ def init_db():
         "evaluated": "INTEGER NOT NULL DEFAULT 0",
         "sent_at": "INTEGER",
         "vote_updated_at": "INTEGER",
+        "ready": "INTEGER NOT NULL DEFAULT 0",  # selected by AI, waiting for a send slot
+        "send_failures": "INTEGER NOT NULL DEFAULT 0",
     }
     added_columns = set()
     for name, definition in additions.items():
@@ -208,6 +235,39 @@ def sent_today(db):
     return int(row["n"])
 
 
+def active_window(day):
+    """Timestamps of the day's ACTIVE_HOURS window."""
+    midnight = datetime(day.year, day.month, day.day, tzinfo=TZ)
+    start = midnight + timedelta(hours=ACTIVE_START)
+    end = midnight + timedelta(hours=ACTIVE_END)
+    return start.timestamp(), end.timestamp()
+
+
+def in_active_hours():
+    start, end = active_window(local_now().date())
+    return start <= time.time() < end
+
+
+def daily_remaining(db):
+    return max(0, DAILY_NEWS_LIMIT - sent_today(db))
+
+
+def available_slots(db):
+    """How many posts may go out right now.
+
+    Outside ACTIVE_HOURS: none. With PACE_POSTS, the daily limit is spread evenly
+    over the active window (one slot opens at its start, the rest at equal
+    intervals), so the day's posts don't all go out at once."""
+    start, end = active_window(local_now().date())
+    now = time.time()
+    if not start <= now < end:
+        return 0
+    allowed = DAILY_NEWS_LIMIT
+    if PACE_POSTS:
+        allowed = min(DAILY_NEWS_LIMIT, int(DAILY_NEWS_LIMIT * (now - start) / (end - start)) + 1)
+    return max(0, allowed - sent_today(db))
+
+
 # ---------- text extraction ----------
 
 SPACE_RE = re.compile(r"\s+")
@@ -282,11 +342,45 @@ def default_profile():
     }
 
 
+# Profile list fields: (max items, max characters per item). Keeps the profile,
+# and every ranking prompt that includes it, from growing without bound.
+PROFILE_LISTS = {
+    "liked_topics": (15, 120),
+    "disliked_topics": (15, 120),
+    "selection_rules": (10, 250),
+}
+PROFILE_SUMMARY_MAX_CHARS = 1000
+
+
+def sanitize_profile(data):
+    """Keep only the expected profile fields, trimmed to size. None if nothing usable."""
+    if not isinstance(data, dict):
+        return None
+    summary = data.get("summary")
+    profile = {
+        "summary": summary.strip()[:PROFILE_SUMMARY_MAX_CHARS] if isinstance(summary, str) else "",
+    }
+    for key, (max_items, max_chars) in PROFILE_LISTS.items():
+        cleaned = []
+        items = data.get(key)
+        for item in items if isinstance(items, list) else []:
+            if len(cleaned) >= max_items:
+                break
+            if isinstance(item, str) and item.strip():
+                text = item.strip()[:max_chars]
+                if text not in cleaned:
+                    cleaned.append(text)
+        profile[key] = cleaned
+    if not profile["summary"] and not any(profile[key] for key in PROFILE_LISTS):
+        return None
+    return profile
+
+
 def load_profile():
     try:
         with open(PROFILE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else default_profile()
+        return sanitize_profile(data) or default_profile()
     except (OSError, ValueError):
         return default_profile()
 
@@ -294,7 +388,7 @@ def load_profile():
 def save_profile(profile):
     path = Path(PROFILE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    profile = dict(profile)
+    profile = dict(sanitize_profile(profile) or default_profile())
     profile["version"] = 1
     profile["updated_at"] = datetime.now(TZ).isoformat()
 
@@ -345,11 +439,28 @@ def extract_json_object(content):
     return None
 
 
-def openrouter_json(prompt, max_tokens):
+def ai_requests_today(db):
+    if get_state(db, "ai_requests_day") != local_now().date().isoformat():
+        return 0
+    return int(get_state(db, "ai_requests", "0") or "0")
+
+
+def count_ai_request(db):
+    count = ai_requests_today(db) + 1
+    set_state(db, "ai_requests_day", local_now().date().isoformat())
+    set_state(db, "ai_requests", count)
+
+
+def openrouter_json(db, prompt, max_tokens):
+    """Returns (result, error). error is None on success, otherwise:
+    "config"    - no API key,
+    "transport" - network/HTTP failure (including quota/rate limits),
+    "output"    - the model answered, but not with a usable JSON object."""
     if not OPENROUTER_API_KEY:
         log.error("OPENROUTER_API_KEY is not configured; AI ranking is disabled")
-        return None
+        return None, "config"
 
+    count_ai_request(db)
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
         "model": OPENROUTER_MODEL,
@@ -371,22 +482,26 @@ def openrouter_json(prompt, max_tokens):
         r.raise_for_status()
         data = r.json()
         choice = data["choices"][0]
-        if choice.get("finish_reason") == "length":
-            log.warning("OpenRouter response reached max_tokens; request will be retried")
-            return None
-        result = extract_json_object(choice.get("message", {}).get("content"))
-        if result is None:
-            log.warning("OpenRouter returned no valid JSON object; request will be retried")
-        else:
-            log.info("OpenRouter request succeeded: model=%s", OPENROUTER_MODEL)
-        return result
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status is not None:
             log.warning("OpenRouter request failed (HTTP %s)", status)
         else:
             log.warning("OpenRouter request failed (%s)", type(e).__name__)
-        return None
+        return None, "transport"
+
+    if not isinstance(choice, dict):
+        log.warning("OpenRouter returned an unexpected response shape")
+        return None, "output"
+    if choice.get("finish_reason") == "length":
+        log.warning("OpenRouter response reached max_tokens")
+        return None, "output"
+    result = extract_json_object((choice.get("message") or {}).get("content"))
+    if result is None:
+        log.warning("OpenRouter returned no valid JSON object")
+        return None, "output"
+    log.info("OpenRouter request succeeded: model=%s", OPENROUTER_MODEL)
+    return result, None
 
 
 def profile_prompt(previous_profile, examples, period_label):
@@ -437,8 +552,8 @@ def bootstrap_profile(db):
     if not rows:
         if not Path(PROFILE_PATH).exists():
             save_profile(previous)
+        mark_profile_current(db, int(time.time()))
         set_state(db, "profile_bootstrapped", "1")
-        set_state(db, "last_profile_day", (local_now().date() - timedelta(days=1)).isoformat())
         log.info("Recommendation profile ready; no historical votes yet")
         return
 
@@ -448,18 +563,21 @@ def bootstrap_profile(db):
         log.warning("Historical votes found, but OPENROUTER_API_KEY is missing; profile bootstrap postponed")
         return
 
+    until = int(time.time())
     examples = [
         {"source": r["source"], "title": r["title"], "vote": r["vote"]}
         for r in rows
     ]
-    result = openrouter_json(
+    result, _ = openrouter_json(
+        db,
         profile_prompt(previous, examples, "all recorded votes"),
         OPENROUTER_PROFILE_MAX_TOKENS,
     )
-    if isinstance(result, dict):
-        save_profile(result)
+    profile = sanitize_profile(result)
+    if profile:
+        save_profile(profile)
+        mark_profile_current(db, until)
         set_state(db, "profile_bootstrapped", "1")
-        set_state(db, "last_profile_day", (local_now().date() - timedelta(days=1)).isoformat())
         log.info("Recommendation profile bootstrapped from %d votes", len(examples))
     else:
         if not Path(PROFILE_PATH).exists():
@@ -467,17 +585,43 @@ def bootstrap_profile(db):
         log.warning("Could not bootstrap recommendation profile; will retry later")
 
 
-def update_profile_for_day(db, day):
-    start, end = day_bounds(day)
+def mark_profile_current(db, until):
+    """Record that the profile includes every vote made up to `until`."""
+    set_state(db, "profile_votes_until", until)
+    set_state(db, "last_profile_day", (local_now().date() - timedelta(days=1)).isoformat())
+
+
+def profile_votes_since(db):
+    """Timestamp after which votes are not yet in the profile."""
+    value = get_state(db, "profile_votes_until")
+    if value:
+        return int(value)
+    # Older versions tracked only the last processed day; start from that day.
+    last = get_state(db, "last_profile_day")
+    if last:
+        try:
+            return day_bounds(date.fromisoformat(last))[0]
+        except ValueError:
+            pass
+    return 0
+
+
+def update_profile_from_votes(db, since, until):
+    """Feed every vote made in (since, until] into the profile, whenever the
+    article was sent. Returns False if the update should be retried."""
     rows = db.execute(
         """
         SELECT source, title, ai_summary, vote
         FROM articles
-        WHERE sent = 1 AND sent_at >= ? AND sent_at < ?
-        ORDER BY sent_at
+        WHERE vote IS NOT NULL AND vote_updated_at > ? AND vote_updated_at <= ?
+        ORDER BY vote_updated_at DESC
+        LIMIT 200
         """,
-        (start, end),
+        (since, until),
     ).fetchall()
+    if not rows:
+        log.info("Nightly profile update skipped: no new votes")
+        return True
 
     examples = [
         {
@@ -488,38 +632,36 @@ def update_profile_for_day(db, day):
         }
         for r in rows
     ]
-
-    previous = load_profile()
-    if not examples or not any(x["vote"] in (1, -1) for x in examples):
-        log.info("Nightly profile update skipped for %s: no new votes", day.isoformat())
-        return True
-
-    result = openrouter_json(
-        profile_prompt(previous, examples, day.isoformat()),
+    label = (
+        f"votes since {datetime.fromtimestamp(since, TZ).isoformat(timespec='minutes')}"
+        if since else "all recorded votes"
+    )
+    result, _ = openrouter_json(
+        db,
+        profile_prompt(load_profile(), examples, label),
         OPENROUTER_PROFILE_MAX_TOKENS,
     )
-    if not isinstance(result, dict):
+    profile = sanitize_profile(result)
+    if not profile:
         return False
 
-    save_profile(result)
-    log.info("Recommendation profile updated for %s from %d sent articles", day.isoformat(), len(examples))
+    save_profile(profile)
+    log.info("Recommendation profile updated from %d new votes", len(examples))
     return True
 
 
 def run_nightly_profile_update(db):
-    today = local_now().date()
-    yesterday = today - timedelta(days=1)
-    last = get_state(db, "last_profile_day")
-
-    if last == yesterday.isoformat():
+    yesterday = local_now().date() - timedelta(days=1)
+    if get_state(db, "last_profile_day") == yesterday.isoformat():
         return
 
     retry_after = int(get_state(db, "profile_retry_after", "0") or "0")
     if int(time.time()) < retry_after:
         return
 
-    if update_profile_for_day(db, yesterday):
-        set_state(db, "last_profile_day", yesterday.isoformat())
+    until = int(time.time())
+    if update_profile_from_votes(db, profile_votes_since(db), until):
+        mark_profile_current(db, until)
         set_state(db, "profile_retry_after", "0")
     else:
         set_state(db, "profile_retry_after", str(int(time.time()) + 3600))
@@ -703,16 +845,39 @@ def expire_old_candidates(db):
         log.info("Expired %d stale candidates", cur.rowcount)
 
 
-def pending_candidates(db):
+def pending_stats(db):
+    row = db.execute(
+        "SELECT COUNT(*) AS n, MIN(added) AS oldest FROM articles WHERE sent = 0 AND evaluated = 0"
+    ).fetchone()
+    return int(row["n"]), row["oldest"]
+
+
+def pending_candidates(db, limit):
+    # Newest first: when a backlog builds up, fresh news is ranked before stale news.
     return db.execute(
         """
         SELECT id, source, title, link, added, excerpt, content
         FROM articles
         WHERE sent = 0 AND evaluated = 0
-        ORDER BY added ASC
+        ORDER BY added DESC
         LIMIT ?
         """,
-        (AI_BATCH_MAX_ITEMS,),
+        (limit,),
+    ).fetchall()
+
+
+def ready_articles(db, limit):
+    """AI-selected articles waiting for a send slot, best first."""
+    cutoff = int(time.time()) - CANDIDATE_MAX_AGE_HOURS * 3600
+    return db.execute(
+        """
+        SELECT id, source, title, link, excerpt, ai_summary, ai_score, send_failures
+        FROM articles
+        WHERE ready = 1 AND sent = 0 AND send_failures < ? AND added >= ?
+        ORDER BY ai_score DESC, added DESC
+        LIMIT ?
+        """,
+        (SEND_MAX_FAILURES, cutoff, limit),
     ).fetchall()
 
 
@@ -767,38 +932,20 @@ Include every supplied id in items exactly once.
 """.strip()
 
 
-def process_candidate_batch(db, force=False):
-    retry_after = int(get_state(db, "ai_retry_after", "0") or "0")
-    if int(time.time()) < retry_after:
-        return
+def ai_backoff(db):
+    """Exponential backoff after a failed ranking request: 5 min, 10, 20, ... up to 2 h."""
+    failures = int(get_state(db, "ai_failures", "0") or "0") + 1
+    delay = min(300 * 2 ** (failures - 1), 7200)
+    set_state(db, "ai_failures", failures)
+    set_state(db, "ai_retry_after", int(time.time()) + delay)
+    log.warning("AI ranking failed %d time(s) in a row; next attempt in %d min", failures, delay // 60)
 
-    capacity = DAILY_NEWS_LIMIT - sent_today(db)
-    if capacity <= 0:
-        return
 
-    rows = pending_candidates(db)
-    if not rows:
-        return
-
-    oldest_age = int(time.time()) - int(rows[0]["added"])
-    if not force and len(rows) < AI_BATCH_SIZE and oldest_age < AI_BATCH_MAX_WAIT:
-        return
-
-    if not OPENROUTER_API_KEY:
-        log.warning("AI candidates are waiting, but OPENROUTER_API_KEY is missing")
-        return
-
-    profile = load_profile()
-    result = openrouter_json(
-        rank_prompt(profile, rows, capacity),
-        OPENROUTER_RANKING_MAX_TOKENS,
-    )
-    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
-        log.warning("OpenRouter ranking returned invalid data; batch kept for retry")
-        set_state(db, "ai_retry_after", str(int(time.time()) + 300))
-        return
-
+def parse_ranking(result, rows):
+    """Map candidate id -> parsed item for every valid item in the model output."""
     by_id = {}
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        return by_id
     valid_ids = {int(r["id"]) for r in rows}
     for item in result["items"]:
         if not isinstance(item, dict):
@@ -811,84 +958,139 @@ def process_candidate_batch(db, force=False):
             by_id[item_id] = {
                 "score": max(0.0, min(100.0, score)),
                 "send": bool(item.get("send", False)),
-                "summary": str(item.get("summary", "")).strip(),
-                "reason": str(item.get("reason", "")).strip(),
+                "summary": str(item.get("summary", "") or "").strip(),
+                "reason": str(item.get("reason", "") or "").strip(),
             }
         except (TypeError, ValueError):
             continue
+    return by_id
 
-    if set(by_id) != valid_ids:
-        log.warning("OpenRouter ranking omitted candidate ids; batch kept for retry")
-        set_state(db, "ai_retry_after", str(int(time.time()) + 300))
+
+def rank_batch(db):
+    """Rank one batch of queued candidates. The best ones are marked ready;
+    send_ready() posts them when send slots open."""
+    now = int(time.time())
+    if now < int(get_state(db, "ai_retry_after", "0") or "0"):
+        return
+    remaining = daily_remaining(db)
+    if remaining <= 0 or not in_active_hours():
         return
 
-    set_state(db, "ai_retry_after", "0")
+    count, oldest = pending_stats(db)
+    if not count:
+        return
+    if count < AI_BATCH_SIZE and now - int(oldest) < AI_BATCH_MAX_WAIT:
+        return
 
-    selected = [
-        (r, by_id[int(r["id"])])
-        for r in rows
-        if by_id[int(r["id"])]["send"]
-        and by_id[int(r["id"])]["score"] >= AI_MIN_SCORE
-    ]
-    selected.sort(key=lambda pair: pair[1]["score"], reverse=True)
-    selected = selected[: min(AI_MAX_SEND_PER_BATCH, capacity)]
-    selected_ids = {int(r["id"]) for r, _ in selected}
+    if not OPENROUTER_API_KEY:
+        log.warning("AI candidates are waiting, but OPENROUTER_API_KEY is missing")
+        set_state(db, "ai_retry_after", now + 3600)
+        return
+    if AI_DAILY_REQUEST_LIMIT > 0 and ai_requests_today(db) >= AI_DAILY_REQUEST_LIMIT:
+        log.warning("AI_DAILY_REQUEST_LIMIT (%d) reached; ranking paused until tomorrow", AI_DAILY_REQUEST_LIMIT)
+        _, tomorrow = day_bounds(local_now().date())
+        set_state(db, "ai_retry_after", tomorrow)
+        return
+
+    # After bad model output, halve the batch each time (10 -> 5 -> 2 -> 1): shorter
+    # input and output usually fix truncated or malformed answers.
+    output_failures = int(get_state(db, "ai_output_failures", "0") or "0")
+    rows = pending_candidates(db, max(1, AI_BATCH_MAX_ITEMS >> output_failures))
+
+    result, error = openrouter_json(
+        db,
+        rank_prompt(load_profile(), rows, remaining),
+        OPENROUTER_RANKING_MAX_TOKENS,
+    )
+    if error in ("transport", "config"):
+        ai_backoff(db)  # network or quota problem: the batch itself is fine, just wait
+        return
+
+    by_id = parse_ranking(result, rows)
+    if not by_id:
+        if len(rows) == 1:
+            # Even a single article can't be ranked: give up on it so it can't
+            # block the queue and burn the request quota.
+            db.execute("UPDATE articles SET evaluated = 1 WHERE id = ?", (rows[0]["id"],))
+            db.commit()
+            set_state(db, "ai_output_failures", 0)
+            log.warning("Article %s could not be ranked; skipped", rows[0]["id"])
+        else:
+            set_state(db, "ai_output_failures", output_failures + 1)
+            log.warning("OpenRouter ranking returned invalid data; retrying with a smaller batch")
+        ai_backoff(db)
+        return
+
+    set_state(db, "ai_failures", 0)
+    set_state(db, "ai_output_failures", 0)
+    set_state(db, "ai_retry_after", 0)
+
+    chosen = sorted(
+        (i for i, info in by_id.items() if info["send"] and info["score"] >= AI_MIN_SCORE),
+        key=lambda i: by_id[i]["score"],
+        reverse=True,
+    )[:AI_MAX_SEND_PER_BATCH]
 
     for r in rows:
-        info = by_id[int(r["id"])]
+        article_id = int(r["id"])
+        info = by_id.get(article_id)
+        if info is None:
+            continue  # model skipped it: stays queued for the next batch
+        ready = article_id in chosen
+        summary = info["summary"]
+        if ready and not summary:
+            summary = clean_text(r["excerpt"])[:1600]
         db.execute(
             """
             UPDATE articles
-            SET ai_score = ?, ai_summary = ?, ai_reason = ?, score = ?
+            SET ai_score = ?, ai_summary = ?, ai_reason = ?, score = ?, evaluated = 1, ready = ?
             WHERE id = ?
             """,
-            (
-                info["score"],
-                info["summary"],
-                info["reason"],
-                info["score"],
-                r["id"],
-            ),
+            (info["score"], summary, info["reason"], info["score"], int(ready), article_id),
         )
     db.commit()
 
-    for r, info in selected:
+    missing = len(rows) - len(by_id)
+    log.info(
+        "AI batch ranked %d candidates, %d ready to send%s",
+        len(by_id), len(chosen),
+        f"; {missing} left without a score stay queued" if missing else "",
+    )
+
+
+def send_ready(db):
+    """Post the best ready articles while send slots are available."""
+    slots = available_slots(db)
+    if slots <= 0:
+        return
+    if int(time.time()) < int(get_state(db, "send_retry_after", "0") or "0"):
+        return
+
+    for r in ready_articles(db, slots):
         article_id = int(r["id"])
-        summary = info["summary"] or clean_text(r["excerpt"])[:1600]
-        if send_article(
-            article_id,
-            r["source"],
-            r["title"],
-            r["link"],
-            summary,
-            info["score"],
-        ):
+        summary = r["ai_summary"] or clean_text(r["excerpt"])[:1600]
+        if send_article(article_id, r["source"], r["title"], r["link"], summary, r["ai_score"]):
             db.execute(
                 "UPDATE articles SET sent = 1, sent_at = ?, evaluated = 1 WHERE id = ?",
                 (int(time.time()), article_id),
             )
             db.commit()
             log.info(
-                "%s: sent AI-selected (%.0f/100) '%s'",
-                r["source"], info["score"], r["title"],
+                "%s: sent AI-selected (%.0f/100) '%s'; %d/%d sent today",
+                r["source"], r["ai_score"] or 0, r["title"], sent_today(db), DAILY_NEWS_LIMIT,
             )
             time.sleep(1)
         else:
-            log.warning("Telegram send failed; article %s left pending", article_id)
-
-    nonselected = [int(r["id"]) for r in rows if int(r["id"]) not in selected_ids]
-    if nonselected:
-        placeholders = ",".join("?" for _ in nonselected)
-        db.execute(
-            f"UPDATE articles SET evaluated = 1 WHERE id IN ({placeholders})",
-            nonselected,
-        )
-        db.commit()
-
-    log.info(
-        "AI batch evaluated %d candidates, selected %d; %d/%d sent today",
-        len(rows), len(selected), sent_today(db), DAILY_NEWS_LIMIT,
-    )
+            # Keep the summary and retry only the send, without another AI request.
+            failures = int(r["send_failures"]) + 1
+            db.execute("UPDATE articles SET send_failures = ? WHERE id = ?", (failures, article_id))
+            db.commit()
+            set_state(db, "send_retry_after", int(time.time()) + 300)
+            if failures >= SEND_MAX_FAILURES:
+                log.warning("Telegram send failed for article %s %d times; giving up on it", article_id, failures)
+            else:
+                log.warning("Telegram send failed for article %s; retrying in 5 min", article_id)
+            return
 
 
 # ---------- main ----------
@@ -898,8 +1100,9 @@ def main():
     bootstrap_profile(db)
 
     log.info(
-        "Bot started: %d sites, %ds checks, daily limit %d, OpenRouter model %s, timezone %s",
-        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, OPENROUTER_MODEL, BOT_TIMEZONE,
+        "Bot started: %d sites, %ds checks, daily limit %d (%s), active hours %d-%d %s, model %s",
+        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, "paced" if PACE_POSTS else "not paced",
+        ACTIVE_START, ACTIVE_END, BOT_TIMEZONE, OPENROUTER_MODEL,
     )
 
     next_check = 0.0
@@ -911,11 +1114,11 @@ def main():
             for source, url in FEEDS.items():
                 collect_source(db, source, url)
             expire_old_candidates(db)
-            process_candidate_batch(db)
             cleanup(db)
             next_check = time.time() + INTERVAL
 
-        process_candidate_batch(db)
+        rank_batch(db)
+        send_ready(db)
 
         wait = max(1, min(25, int(next_check - time.time())))
         handle_updates(db, wait)
