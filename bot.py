@@ -3,30 +3,30 @@ Telegram news bot with AI-assisted recommendations.
 
 Behavior:
 - Collects new articles from RSS feeds instead of sending everything immediately.
-- Uses OpenRouter in batches to rank articles against a persistent recommendation profile.
+- Uses Polza in batches to rank articles against a persistent recommendation profile.
 - Sends at most DAILY_NEWS_LIMIT articles per local calendar day.
 - Sends an AI summary of each selected article plus source/link.
 - 👍 / 👎 votes are stored in SQLite.
 - At the first AI-enabled start, existing votes bootstrap the recommendation profile.
-- After local midnight, one OpenRouter request updates the profile from the previous day's results.
+- After local midnight, one Polza request updates the profile from the previous day's results.
 
 Environment:
   BOT_TOKEN             Telegram bot token (required)
   CHAT_ID               Telegram user/chat id (required)
-  OPENROUTER_API_KEY    OpenRouter API key (required for AI ranking)
-  OPENROUTER_MODEL      default: nvidia/nemotron-3.5-lightning:free
+  POLZA_API_KEY          Polza API key (required for AI ranking)
+  POLZA_MODEL            default: openai/gpt-6-luna
   CHECK_INTERVAL        RSS check interval seconds (default: 600)
   DB_PATH               SQLite path (default: news.db)
   PROFILE_PATH          profile JSON path (default: next to DB)
   BOT_TIMEZONE          IANA timezone for the daily limit (default: Asia/Novosibirsk)
   DAILY_NEWS_LIMIT      maximum sent articles per calendar day (default: 10)
   AI_BATCH_SIZE         process immediately when at least this many candidates exist (default: 5)
-  AI_BATCH_MAX_ITEMS    max candidates in one OpenRouter request (default: 10)
+  AI_BATCH_MAX_ITEMS    max candidates in one Polza request (default: 10)
   AI_BATCH_MAX_WAIT     flush a smaller batch after this many seconds (default: 3600)
   AI_MAX_SEND_PER_BATCH max articles sent from one batch (default: 3)
   AI_MIN_SCORE          minimum AI relevance score, 0..100 (default: 65)
-  OPENROUTER_RANKING_MAX_TOKENS max output tokens per batch (default: 8192)
-  OPENROUTER_PROFILE_MAX_TOKENS max output tokens per profile update (default: 2048)
+  OPENROUTER_RANKING_MAX_TOKENS max output tokens per batch (default: 8192; legacy name)
+  OPENROUTER_PROFILE_MAX_TOKENS max output tokens per profile update (default: 2048; legacy name)
   ALLOWED_VOTERS        comma-separated Telegram user ids allowed to vote
 """
 import html
@@ -49,9 +49,9 @@ from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"
+POLZA_API_KEY = os.environ.get("POLZA_API_KEY", "").strip()
+POLZA_MODEL = os.environ.get(
+    "POLZA_MODEL", "openai/gpt-6-luna"
 ).strip()
 OPENROUTER_RANKING_MAX_TOKENS = int(
     os.environ.get("OPENROUTER_RANKING_MAX_TOKENS", "8192")
@@ -311,7 +311,7 @@ def save_profile(profile):
             pass
 
 
-# ---------- OpenRouter ----------
+# ---------- Polza ----------
 
 def extract_json_object(content):
     """Parse a JSON object from plain, fenced, or prose-wrapped model output."""
@@ -345,24 +345,23 @@ def extract_json_object(content):
     return None
 
 
-def openrouter_json(prompt, max_tokens):
-    if not OPENROUTER_API_KEY:
-        log.error("OPENROUTER_API_KEY is not configured; AI ranking is disabled")
+def polza_json(prompt, max_tokens):
+    if not POLZA_API_KEY:
+        log.error("POLZA_API_KEY is not configured; AI ranking is disabled")
         return None
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = "https://polza.ai/api/v1/chat/completions"
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": POLZA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
         "max_tokens": max_tokens,
-        "reasoning": {"enabled": False},
+        "reasoning_effort": "none",
     }
     try:
         r = requests.post(
             url,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {POLZA_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -372,20 +371,20 @@ def openrouter_json(prompt, max_tokens):
         data = r.json()
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
-            log.warning("OpenRouter response reached max_tokens; request will be retried")
+            log.warning("Polza response reached max_tokens; request will be retried")
             return None
         result = extract_json_object(choice.get("message", {}).get("content"))
         if result is None:
-            log.warning("OpenRouter returned no valid JSON object; request will be retried")
+            log.warning("Polza returned no valid JSON object; request will be retried")
         else:
-            log.info("OpenRouter request succeeded: model=%s", OPENROUTER_MODEL)
+            log.info("Polza request succeeded: model=%s", POLZA_MODEL)
         return result
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status is not None:
-            log.warning("OpenRouter request failed (HTTP %s)", status)
+            log.warning("Polza request failed (HTTP %s)", status)
         else:
-            log.warning("OpenRouter request failed (%s)", type(e).__name__)
+            log.warning("Polza request failed (%s)", type(e).__name__)
         return None
 
 
@@ -442,17 +441,17 @@ def bootstrap_profile(db):
         log.info("Recommendation profile ready; no historical votes yet")
         return
 
-    if not OPENROUTER_API_KEY:
+    if not POLZA_API_KEY:
         if not Path(PROFILE_PATH).exists():
             save_profile(previous)
-        log.warning("Historical votes found, but OPENROUTER_API_KEY is missing; profile bootstrap postponed")
+        log.warning("Historical votes found, but POLZA_API_KEY is missing; profile bootstrap postponed")
         return
 
     examples = [
         {"source": r["source"], "title": r["title"], "vote": r["vote"]}
         for r in rows
     ]
-    result = openrouter_json(
+    result = polza_json(
         profile_prompt(previous, examples, "all recorded votes"),
         OPENROUTER_PROFILE_MAX_TOKENS,
     )
@@ -494,7 +493,7 @@ def update_profile_for_day(db, day):
         log.info("Nightly profile update skipped for %s: no new votes", day.isoformat())
         return True
 
-    result = openrouter_json(
+    result = polza_json(
         profile_prompt(previous, examples, day.isoformat()),
         OPENROUTER_PROFILE_MAX_TOKENS,
     )
@@ -784,17 +783,17 @@ def process_candidate_batch(db, force=False):
     if not force and len(rows) < AI_BATCH_SIZE and oldest_age < AI_BATCH_MAX_WAIT:
         return
 
-    if not OPENROUTER_API_KEY:
-        log.warning("AI candidates are waiting, but OPENROUTER_API_KEY is missing")
+    if not POLZA_API_KEY:
+        log.warning("AI candidates are waiting, but POLZA_API_KEY is missing")
         return
 
     profile = load_profile()
-    result = openrouter_json(
+    result = polza_json(
         rank_prompt(profile, rows, capacity),
         OPENROUTER_RANKING_MAX_TOKENS,
     )
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
-        log.warning("OpenRouter ranking returned invalid data; batch kept for retry")
+        log.warning("Polza ranking returned invalid data; batch kept for retry")
         set_state(db, "ai_retry_after", str(int(time.time()) + 300))
         return
 
@@ -818,7 +817,7 @@ def process_candidate_batch(db, force=False):
             continue
 
     if set(by_id) != valid_ids:
-        log.warning("OpenRouter ranking omitted candidate ids; batch kept for retry")
+        log.warning("Polza ranking omitted candidate ids; batch kept for retry")
         set_state(db, "ai_retry_after", str(int(time.time()) + 300))
         return
 
@@ -898,8 +897,8 @@ def main():
     bootstrap_profile(db)
 
     log.info(
-        "Bot started: %d sites, %ds checks, daily limit %d, OpenRouter model %s, timezone %s",
-        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, OPENROUTER_MODEL, BOT_TIMEZONE,
+        "Bot started: %d sites, %ds checks, daily limit %d, Polza model %s, timezone %s",
+        len(FEEDS), INTERVAL, DAILY_NEWS_LIMIT, POLZA_MODEL, BOT_TIMEZONE,
     )
 
     next_check = 0.0

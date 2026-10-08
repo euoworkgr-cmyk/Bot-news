@@ -4,7 +4,7 @@ This document describes the repository as it exists today. Read it before making
 
 ## Overview
 
-A Telegram bot that collects articles from configured RSS feeds, ranks candidates in batches with an OpenRouter model, and posts selected stories with summaries and source links. Readers can vote on posts; votes update a local recommendation profile.
+A Telegram bot that collects articles from configured RSS feeds, ranks candidates in batches with the Polza AI model, and posts selected stories with summaries and source links. Readers can vote on posts; votes update a local recommendation profile.
 
 ## Current behavior
 
@@ -33,13 +33,13 @@ See `.env.example` for the configuration template. Keep credentials in an untrac
 
 Important settings include:
 
-- `BOT_TOKEN`, `CHAT_ID`, and `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL` and the profile/ranking token limits
+- `BOT_TOKEN`, `CHAT_ID`, and `POLZA_API_KEY`
+- `POLZA_MODEL` and the profile/ranking token limits
 - `CHECK_INTERVAL`, `BOT_TIMEZONE`, and `DAILY_NEWS_LIMIT`
 - `AI_BATCH_SIZE`, `AI_BATCH_MAX_ITEMS`, `AI_BATCH_MAX_WAIT`, `AI_MAX_SEND_PER_BATCH`, and `AI_MIN_SCORE`
 - `ARTICLE_MAX_CHARS`, `CANDIDATE_MAX_AGE_HOURS`, and `ALLOWED_VOTERS`
 
-The default model is `nvidia/nemotron-3.5-lightning:free`. OpenRouter limits and model availability can change; check current provider documentation before relying on a quota.
+The default model is `openai/gpt-6-luna`, called through `https://polza.ai/api/v1`. The request uses `reasoning_effort=none` for these focused tasks. Polza AI limits and model availability can change; check current provider documentation before relying on a quota.
 
 ## Deployment
 
