@@ -667,8 +667,9 @@ def send_article(article_id, source, title, link, summary, ai_score):
     if not valid_russian_summary(summary):
         raise ValueError("Invalid Russian summary")
 
+    safe_title = html.escape((title or "")[:300])
     text = (
-        f"<b>{html.escape((title or "")[:300])}</b>\n\n"
+        f"<b>{safe_title}</b>\n\n"
         f"{html.escape(summary)}\n\n"
         f"Источник: {html.escape(source)}\n"
         f"{html.escape(link)}"
