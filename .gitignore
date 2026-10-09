@@ -6,3 +6,17 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+
+# SQLite WAL files, process locks and operator backups
+*.db-wal
+*.db-shm
+*.db.lock
+*.db.backup-*
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock
+*.sqlite.backup-*
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.lock
+*.sqlite3.backup-*
